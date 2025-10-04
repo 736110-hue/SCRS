@@ -1,13 +1,14 @@
-from flask import Flask, request, jsonify, render_template,redirect, url_for, session
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session, current_app
 import pickle
 import numpy as np
 from flask_cors import CORS
 import sqlite3
-from datetime import datetime , timedelta
+from datetime import datetime, timedelta
 import os
 import threading
 import uuid
-from flask import current_app
+import requests
+import json
 
 app = Flask(__name__)
 CORS(app)
@@ -24,71 +25,6 @@ ADMIN_USER = 'admin'
 ADMIN_PASS = 'adminpass'
 ADMIN_TOKEN = 'admintoken123'  # simple static token for demo
 
-@app.route('/login', methods=['GET', 'POST'])
-def login_page():
-    if request.method == 'POST':
-        mobile = request.form['mobile']
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute('SELECT id FROM users WHERE mobile = ?', (mobile,))
-        user = cur.fetchone()
-        conn.close()
-        if user:
-            session['user_id'] = user['id']
-            return redirect(url_for('predict_page'))
-        else:
-            return render_template('login.html', error='Mobile not found')
-    return render_template('login.html')
-
-@app.route('/predict', methods=['POST'])
-def handle_prediction():
-    if not session.get('user_id'):
-        return redirect(url_for('login_page'))
-    return render_template('smart_crop_recommendation_multilang.html')
-
-@app.route('/predict', methods=['POST'])
-def predict():
-    if not session.get('user_id'):
-        return redirect(url_for('login_page'))
-    try:
-        N = float(request.form['N'])
-        P = float(request.form['P'])
-        K = float(request.form['K'])
-        temperature = float(request.form['temperature'])
-        humidity = float(request.form['humidity'])
-        ph = float(request.form['ph'])
-        rainfall = float(request.form['rainfall'])
-        
-        
-        mandi_trends = get_mandi_trends()
-        rice_price = mandi_trends.get("Rice", 0)
-        maize_price = mandi_trends.get("Maize", 0)
-        # Add these to your input vector if your model supports it
-        input_data = np.array([[N, P, K, temperature, humidity, ph, rainfall, rice_price, maize_price]])
-
-
-
-
-
-        # input_data = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
-        input_scaled = scaler.transform(input_data)
-        prediction = model.predict(input_scaled)[0]
-        crop = crop_dict.get(prediction, "Unknown")
-
-        return render_template('result.html', crop=crop)
-    except Exception as e:
-        return render_template('smart_crop_recommendation_multilang.html', error=str(e))
-
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('main_page'))
-
-
-
-
-
-
 def admin_required(fn):
     def wrapper(*args, **kwargs):
         token = request.headers.get('X-Admin-Token')
@@ -99,7 +35,6 @@ def admin_required(fn):
     wrapper.__name__ = fn.__name__
     return wrapper
 
-
 DB_PATH = os.path.join(os.path.dirname(__file__), 'users.db')
 
 def get_db_connection():
@@ -108,9 +43,7 @@ def get_db_connection():
     conn.row_factory = sqlite3.Row
     return conn
 
-
 def get_mandi_trends():
-    import json
     try:
         with open("mandi_data.txt", "r", encoding="utf-8") as file:
             data = json.load(file)
@@ -130,7 +63,6 @@ def get_mandi_trends():
     except Exception as e:
         print("❌ Error parsing mandi data:", e)
         return {}
-
 
 def init_db():
     # initialize DB and enable WAL to reduce write locks
@@ -168,20 +100,13 @@ def init_db():
             FOREIGN KEY(user_id) REFERENCES users(id)
         )
     ''')
-    # If DB existed previously, ensure column `input_source` exists
-    try:
-        cur.execute("PRAGMA table_info(predictions)")
-        cols = [r[1] for r in cur.fetchall()]
-        if 'input_source' not in cols:
-            cur.execute("ALTER TABLE predictions ADD COLUMN input_source TEXT")
-    except Exception:
-        pass
+    # feedback table will be created on demand if needed (keeps init simple)
     conn.commit()
     conn.close()
 
 # Load model and scaler (use file-relative paths so working dir doesn't matter)
-MODEL_PATH = os.path.join(os.path.dirname(__file__),'model', 'model.pkl')
-SCALER_PATH = os.path.join(os.path.dirname(__file__),'model', 'minmaxscaler.pkl')
+MODEL_PATH = os.path.join(os.path.dirname(__file__), 'model', 'model.pkl')
+SCALER_PATH = os.path.join(os.path.dirname(__file__), 'model', 'minmaxscaler.pkl')
 model = None
 scaler = None
 try:
@@ -195,8 +120,6 @@ try:
 except Exception as e:
     print(f"Warning: could not load scaler from {SCALER_PATH}: {e}")
 
-
-
 # Crop dictionary (update as per your notebook)
 crop_dict = {
     1: "Rice", 2: "Maize", 3: "Jute", 4: "Cotton", 5: "Coconut", 6: "Papaya", 7: "Orange",
@@ -209,73 +132,84 @@ crop_dict = {
 def main_page():
     return render_template('smart_crop_system_main.html')
 
-@app.route('/predict-page')
+# Show prediction page (GET) and accept form POST on same URL
+@app.route('/predict', methods=['GET'])
 def predict_page():
+    if not session.get('user_id'):
+        # if you prefer public access change this logic
+        return redirect(url_for('login_page'))
     return render_template('smart_crop_recommendation_multilang.html')
 
-@app.route('/register')
-def register_page():
-    return render_template('register.html')
-
-@app.route('/api/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    name = data.get('name')
-    mobile = data.get('mobile')
-    address = data.get('address', '')
-    if not name or not mobile:
-        return jsonify({'error': 'name and mobile are required'}), 400
+@app.route('/predict', methods=['POST'])
+def predict_post():
+    if not session.get('user_id'):
+        return redirect(url_for('login_page'))
     try:
+        N = float(request.form.get('N', 0))
+        P = float(request.form.get('P', 0))
+        K = float(request.form.get('K', 0))
+        temperature = float(request.form.get('temperature', 0))
+        humidity = float(request.form.get('humidity', 0))
+        ph = float(request.form.get('ph', 0))
+        rainfall = float(request.form.get('rainfall', 0))
+
+        # Optional: include mandi trends in feature vector only if model expects those
+        mandi_trends = get_mandi_trends()
+        rice_price = mandi_trends.get("Rice", 0)
+        maize_price = mandi_trends.get("Maize", 0)
+
+        # Build input vector example: modify if model expects different shape
+        input_data = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
+
+        if scaler is None or model is None:
+            return render_template('smart_crop_recommendation_multilang.html', error='Model or scaler not loaded; please retrain or add artifacts.')
+
+        input_scaled = scaler.transform(input_data)
+        prediction = model.predict(input_scaled)[0]
+        crop = crop_dict.get(int(prediction), "Unknown")
+
+        return render_template('result.html', crop=crop)
+    except Exception as e:
+        return render_template('smart_crop_recommendation_multilang.html', error=str(e))
+
+@app.route('/predict-page')
+def predict_page_legacy():
+    # keep legacy route used by some templates
+    return redirect(url_for('predict_page'))
+
+@app.route('/login', methods=['GET', 'POST'])
+def login_page():
+    if request.method == 'POST':
+        mobile = request.form.get('mobile')
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute('INSERT INTO users (name, mobile, address, created_at) VALUES (?,?,?,?)',
-                    (name, mobile, address, datetime.utcnow().isoformat()))
-        conn.commit()
-        user_id = cur.lastrowid
+        cur.execute('SELECT id FROM users WHERE mobile = ?', (mobile,))
+        user = cur.fetchone()
         conn.close()
-        return jsonify({'status': 'registered', 'user_id': user_id})
-    except sqlite3.IntegrityError:
-        return jsonify({'error': 'mobile already registered'}), 409
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    data = request.get_json()
-    mobile = data.get('mobile')
-    if not mobile:
-        return jsonify({'error': 'mobile is required'}), 400
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id, name, mobile, address, created_at FROM users WHERE mobile = ?', (mobile,))
-    row = cur.fetchone()
-    conn.close()
-    if row:
-        return jsonify(dict(row))
-    return jsonify({'error': 'not found'}), 404
-
-
-@app.route('/admin/dashboard')
-def admin_dashboard():
-    return render_template('admin.html')
-
-@app.route('/admin/login')
-def admin_login_page():
+        if user:
+            session['user_id'] = user['id']
+            return redirect(url_for('predict_page'))
+        else:
+            return render_template('login.html', error='Mobile not found')
     return render_template('login.html')
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('main_page'))
+
 
 active_tokens = {}  # token: expiry_time
 @app.route('/api/admin/login', methods=['POST'])
 def admin_login():
-    data = request.get_json()
+    data = request.get_json() or {}
     user = data.get('username')
     pwd = data.get('password')
     if user == ADMIN_USER and pwd == ADMIN_PASS:
-        expiry = datetime.utcnow() + timedelta(seconds=60)
+        expiry = datetime.utcnow() + timedelta(minutes=30)  # longer expiry for admin session
         active_tokens[ADMIN_TOKEN] = expiry
         return jsonify({'token': ADMIN_TOKEN})
     return jsonify({'error': 'invalid credentials'}), 401
-
 
 @app.route('/api/admin/users', methods=['GET'])
 @admin_required
@@ -286,7 +220,6 @@ def admin_list_users():
     rows = cur.fetchall()
     conn.close()
     return jsonify({'users': [dict(r) for r in rows]})
-
 
 @app.route('/api/admin/user/<int:user_id>/delete', methods=['POST'])
 @admin_required
@@ -301,7 +234,6 @@ def admin_delete_user(user_id):
         return jsonify({'status': 'deleted'})
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-
 
 @app.route('/api/iot/start', methods=['POST'])
 @admin_required
@@ -325,7 +257,6 @@ def iot_start():
         client.subscribe(topic)
         _mqtt_client = client
         _mqtt_running = True
-        # run loop in a background thread
         _mqtt_thread = threading.Thread(target=client.loop_forever, daemon=True)
         _mqtt_thread.start()
         return jsonify({'status': 'started'})
@@ -351,7 +282,6 @@ def iot_latest():
         return jsonify(_latest_iot)
     return jsonify({'error': 'no data yet'}), 404
 
-
 @app.route('/api/recommend', methods=['POST'])
 def recommend():
     data = request.get_json()
@@ -365,30 +295,8 @@ def recommend():
         ph = float(data['ph'])
         rainfall = float(data['rainfall'])
 
-        # 2. Load mandi trends
-        def get_mandi_trends():
-            import json
-            try:
-                with open("mandi_data.txt", "r", encoding="utf-8") as file:
-                    data = json.load(file)
-                    records = data.get("records", [])
-                    price_map = {}
-                    for record in records:
-                        crop = record.get("commodity")
-                        modal_price = int(record.get("modal_price") or 0)
-                        if crop:
-                            if crop not in price_map:
-                                price_map[crop] = []
-                            price_map[crop].append(modal_price)
-                    avg_prices = {crop: sum(prices)//len(prices) for crop, prices in price_map.items()}
-                    return avg_prices
-            except Exception as e:
-                print("❌ Error parsing mandi data:", e)
-                return {}
-
         mandi_trends = get_mandi_trends()
 
-        # 3. Forecast modal price for next 3 months
         def forecast_price(crop_name, trends):
             import random
             base = trends.get(crop_name, 0)
@@ -396,7 +304,6 @@ def recommend():
                 return [0, 0, 0]
             return [int(base * (1 + random.uniform(-0.05, 0.05))) for _ in range(3)]
 
-        # 4. Predict crop
         features = np.array([[N, P, K, temperature, humidity, ph, rainfall]])
         print(f"Received input: N={N}, P={P}, K={K}, temperature={temperature}, humidity={humidity}, ph={ph}, rainfall={rainfall}")
         if scaler is None or model is None:
@@ -411,7 +318,7 @@ def recommend():
             probs = None
 
         prediction = model.predict(transformed)[0]
-        crop = crop_dict.get(prediction, "Unknown")
+        crop = crop_dict.get(int(prediction), "Unknown")
         print(f"Predicted crop: {crop}")
 
         forecasted_prices = forecast_price(crop, mandi_trends)
@@ -433,16 +340,15 @@ def recommend():
         try:
             conn = get_db_connection()
             cur = conn.cursor()
-            cur.execute('''INSERT INTO predictions (user_id, N, P, K, temperature, humidity, ph, rainfall, predicted_crop, created_at)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)''',
-                        (user_id, N, P, K, temperature, humidity, ph, rainfall, crop, datetime.utcnow().isoformat()))
+            cur.execute('''INSERT INTO predictions (user_id, N, P, K, temperature, humidity, ph, rainfall, predicted_crop, created_at, input_source)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                        (user_id, N, P, K, temperature, humidity, ph, rainfall, crop, datetime.utcnow().isoformat(), data.get('input_source')))
             conn.commit()
             prediction_id = cur.lastrowid
             conn.close()
         except Exception as e:
             print(f"Warning: could not save prediction: {e}")
 
-        # 7. Return result
         response = {
             'crop': crop,
             'prediction_id': prediction_id if 'prediction_id' in locals() else None,
@@ -464,77 +370,6 @@ def recommend():
         print(f"Error: {e}")
         return jsonify({'error': str(e)}), 400
 
-
-
-def _mqtt_on_message(client, userdata, msg):
-    global _latest_iot
-    try:
-        import json
-        payload = msg.payload.decode('utf-8')
-        data = json.loads(payload)
-        _latest_iot = {'topic': msg.topic, 'data': data, 'timestamp': datetime.utcnow().isoformat()}
-    except Exception:
-        pass
-
-
-
-
-@app.route('/api/feedback', methods=['POST'])
-def feedback():
-    """Record user feedback: actual crop name for a previous prediction.
-    Expected JSON: { mobile: '...', prediction_id: <optional>, actual_crop: 'Mango' }
-    """
-    data = request.get_json() or {}
-    mobile = data.get('mobile')
-    actual_crop = data.get('actual_crop')
-    prediction_id = data.get('prediction_id')
-    if not mobile or not actual_crop:
-        return jsonify({'error': 'mobile and actual_crop are required'}), 400
-    # resolve user id
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute('SELECT id FROM users WHERE mobile = ?', (mobile,))
-    row = cur.fetchone()
-    if not row:
-        conn.close()
-        return jsonify({'error': 'user not found'}), 404
-    user_id = row['id']
-    try:
-        # store feedback as a special row in predictions with predicted_crop set to actual and a flag in address? Use a separate table
-        cur.execute('''CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            prediction_id INTEGER,
-            N REAL, P REAL, K REAL, temperature REAL, humidity REAL, ph REAL, rainfall REAL,
-            actual_crop TEXT,
-            created_at TEXT NOT NULL
-        )''')
-        # if prediction_id supplied, try to copy features from predictions
-        N = P = K = temperature = humidity = ph = rainfall = None
-        if prediction_id:
-            cur.execute('SELECT N,P,K,temperature,humidity,ph,rainfall,input_source FROM predictions WHERE id = ?', (prediction_id,))
-            p = cur.fetchone()
-            if p:
-                # only accept feedback copied from IoT-origin predictions
-                input_source = p['input_source'] if 'input_source' in p.keys() else None
-                if input_source != 'iot':
-                    conn.close()
-                    return jsonify({'error': 'feedback allowed only for predictions originating from IoT sensors'}), 403
-                N = p['N']; P = p['P']; K = p['K']; temperature = p['temperature']; humidity = p['humidity']; ph = p['ph']; rainfall = p['rainfall']
-        # insert feedback row
-        cur.execute('''INSERT INTO feedback (user_id,prediction_id,N,P,K,temperature,humidity,ph,rainfall,actual_crop,created_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?)''', (user_id, prediction_id, N, P, K, temperature, humidity, ph, rainfall, actual_crop, datetime.utcnow().isoformat()))
-        conn.commit()
-        conn.close()
-        return jsonify({'status': 'feedback recorded'})
-    except Exception as e:
-        conn.close()
-        return jsonify({'error': str(e)}), 500
-
-
-
-
-
 # --- Background retrain job system (simple in-memory) ---
 _jobs = {}
 _jobs_lock = threading.Lock()
@@ -548,10 +383,10 @@ def _run_retrain_job(job_id):
         import pandas as pd
         from sklearn.preprocessing import MinMaxScaler, LabelEncoder
         from sklearn.ensemble import RandomForestClassifier
-        # load original dataset
-        csvpath = os.path.join(os.path.dirname(__file__), 'Crop_recommendation.csv')
+        # load original dataset — fixed to data/Crop_recommendation.csv
+        csvpath = os.path.join(os.path.dirname(__file__), 'data', 'Crop_recommendation.csv')
         if not os.path.exists(csvpath):
-            raise RuntimeError('original dataset not found')
+            raise RuntimeError('original dataset not found at ' + csvpath)
         df = pd.read_csv(csvpath)
         if 'Crop' not in df.columns:
             raise RuntimeError('dataset missing Crop column')
@@ -567,7 +402,7 @@ def _run_retrain_job(job_id):
                 fb = pd.DataFrame(rows, columns=['N','P','K','temperature','humidity','ph','rainfall','actual_crop'])
                 unseen = set(fb['actual_crop'].astype(str).unique()) - set(le.classes_)
                 if unseen:
-                    le.classes_ = list(le.classes_) + list(unseen)
+                    le.classes_ = np.concatenate((le.classes_, list(unseen)))
                 fb['crop_label'] = le.transform(fb['actual_crop'].astype(str))
                 df_fb = fb[['N','P','K','temperature','humidity','ph','rainfall','crop_label']]
                 df = pd.concat([df, df_fb.rename(columns={'crop_label':'crop_label'})], ignore_index=True, sort=False)
@@ -577,7 +412,6 @@ def _run_retrain_job(job_id):
         feature_cols = ['N','P','K','temperature','humidity','ph','rainfall']
         X_full = df[feature_cols].astype(float).fillna(0)
         y_full = df['crop_label']
-        # update progress
         with _jobs_lock:
             _jobs[job_id]['progress'] = 20
         ms = MinMaxScaler()
@@ -606,17 +440,9 @@ def _run_retrain_job(job_id):
             _jobs[job_id]['error'] = str(e)
             _jobs[job_id]['finished_at'] = datetime.utcnow().isoformat()
 
-
-
-
-
 @app.route('/api/admin/retrain', methods=['POST'])
 @admin_required
 def admin_retrain():
-    """Retrain model using original dataset plus feedback when available.
-    This is a simple retrain: fits MinMaxScaler on combined features and trains RandomForest.
-    """
-    # Enqueue retrain as a background job and return job id
     job_id = str(uuid.uuid4())
     with _jobs_lock:
         _jobs[job_id] = {'status': 'queued', 'progress': 0, 'started_at': None, 'finished_at': None, 'error': None}
@@ -624,7 +450,6 @@ def admin_retrain():
     t.daemon = True
     t.start()
     return jsonify({'job_id': job_id, 'status': 'queued'})
-
 
 @app.route('/api/admin/retrain/status/<job_id>', methods=['GET'])
 @admin_required
@@ -635,10 +460,8 @@ def retrain_status(job_id):
             return jsonify({'error': 'job not found'}), 404
         return jsonify(job)
 
-
 @app.route('/api/admin/test_market', methods=['GET'])
 def admin_test_market():
-    # optional: protect with admin token if you implemented check_admin_token()
     try:
         if 'check_admin_token' in globals() and not check_admin_token():
             return jsonify({'error':'unauthorized'}), 401
